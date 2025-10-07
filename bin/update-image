@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# bin/update-image
+set -euo pipefail
+
+# --- Locate project root (same pattern as main) ---
+rootpath() {
+  local dir
+  dir=$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")
+  if [[ -f "${dir}/../LICENSE" ]]; then
+    echo "$(readlink -f "${dir}/..")"
+  elif [[ -d /usr/share/rpi-image-gen ]]; then
+    echo /usr/share/rpi-image-gen
+  else
+    echo "FATAL: cannot locate project root" >&2; exit 1
+  fi
+}
+readonly IGTOP=$(rootpath)
+
+# --- Helpers (reuse upstream) ---
+# shellcheck source=/dev/null
+source "$IGTOP/lib/common.sh"   # run, runenv, runhook, die, msg, warn
+PATH="$IGTOP/bin:$PATH"
+
+usage() {
+  cat <<EOF
+Usage: rpi-image-gen update-image -i /path/to/image.img [-S /extra/search] [-c config.yaml] [IGconf_* overrides...]
+
+Examples:
+  rpi-image-gen update-image -i ./work/my.img -S ./ext -c ./custom.yaml IGconf_device_hostname=foo
+  rpi-image-gen update-image -i ./work/my.img IGconf_update_pkgs="htop curl"   # will apt-get install inside the image
+
+What it does:
+  * Maps the image with losetup, mounts boot+root
+  * Applies any rootfs overlays from image/device asset dirs found along the search path
+  * Runs device/image post-build hooks against the mounted rootfs
+  * Optionally runs a chroot "package update" step if IGconf_update_pkgs is set
+  * Unmounts and detaches loop device (even on errors)
+EOF
+}
+
+IMG=""
+SRCDIR="$(pwd)"
+CONFIG=""
+EXTRA_ARGS=()
+
+# Parse flags
+while (( "$#" )); do
+  case "${1:-}" in
+    -i|--image) IMG="$(readlink -f "$2")"; shift 2;;
+    -S|--src)   SRCDIR="$(readlink -f "$2")"; shift 2;;
+    -c|--config) CONFIG="$(readlink -f "$2")"; shift 2;;
+    -h|--help) usage; exit 0;;
+    IGconf_*=*) EXTRA_ARGS+=("$1"); shift;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 2;;
+  esac
+done
+
+[[ -n "$IMG" && -f "$IMG" ]] || die "-i/--image is required and must point to an existing .img"
+
+# --- Context like main driver ---
+declare -A ctx=(
+  [SRC_DIR]="$SRCDIR"
+  [TMPDIR]="$(mktemp -d)"
+)
+trap 'rc=$?; set +e; if mountpoint -q "${MNT_ROOT:-/mnt/none}"; then sudo umount -R "${MNT_ROOT}"; fi; if mountpoint -q "${MNT_BOOT:-/mnt/none}"; then sudo umount -R "${MNT_BOOT}"; fi; [[ -n "${LOOPDEV:-}" ]] && sudo losetup -d "${LOOPDEV}" || true; rm -rf "${ctx[TMPDIR]}"; exit $rc' EXIT
+
+# Build PATH/CONFIG/LAYER search like upstream path_refresh
+CONFIG_PATH="$IGTOP/config"
+LAYER_PATH="$IGTOP/device:$IGTOP/image:$IGTOP/layer"
+if [[ ! "$IGTOP" -ef "${ctx[SRC_DIR]}" ]]; then
+  [[ -d "${ctx[SRC_DIR]}/config" ]] && CONFIG_PATH="${ctx[SRC_DIR]}/config:${CONFIG_PATH}"
+  for d in device image layer; do
+    [[ -d "${ctx[SRC_DIR]}/$d" ]] && LAYER_PATH="${ctx[SRC_DIR]}/$d:${LAYER_PATH}"
+  done
+fi
+
+# Optional: parse config into env (so IGconf_* get computed from YAML)
+IGENVF="${ctx[TMPDIR]}/ig.env"; : > "$IGENVF"
+OVR="${ctx[TMPDIR]}/overrides.env"; : > "$OVR"
+for kv in "${EXTRA_ARGS[@]}"; do echo "$kv" >> "$OVR"; done
+if [[ -n "$CONFIG" ]]; then
+  ig config --path "$CONFIG_PATH" "$CONFIG" --overrides "$OVR" --write-to "$IGENVF" \
+    || die "Config parse failed"
+fi
+# Always add hooks dir env var like main
+echo "LAYER_HOOKS=\"$IGTOP/layer-hooks\"" >> "$IGENVF"
+echo "RPI_TEMPLATES=\"$IGTOP/templates/rpi\"" >> "$IGENVF"
+
+# Export key vars
+mapfile -t ENVVARS <
