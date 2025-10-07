@@ -10,6 +10,7 @@ PROFILE_ID=""            # -p ID   (profile file listing layer names)
 LAYER_CSV=""             # --layers id1,id2,...
 declare -a VARS=()       # --var KEY=VALUE (repeatable)
 RSYNC_OPTS="-aHAX --numeric-ids --inplace"
+RSYNC_OPTS_BOOT="-rlt --inplace --no-perms --no-owner --no-group"
 
 usage() {
   cat <<'EOF'
@@ -144,10 +145,17 @@ fi
 # Map & mount
 echo "Mapping loop device..."
 LOOPDEV="$(sudo losetup -Pf --show "$IMG")"
+sudo mount "${LOOPDEV}p1" "$BOOT_MNT"
 
-if ! sudo mount "${LOOPDEV}p1" "$BOOT_MNT"; then
-  echo "ERROR: cannot mount ${LOOPDEV}p1 as boot"; exit 1
+# Detect FS type
+FSTYPE=$(lsblk -no FSTYPE "${LOOPDEV}p1" | head -n1 || true)
+if [[ "$FSTYPE" == "vfat" || "$FSTYPE" == "exfat" || "$FSTYPE" == "fat32" || "$FSTYPE" == "fat" ]]; then
+  # remount with root ownership mapping to avoid odd UIDs
+  sudo umount "$BOOT_MNT"
+  sudo mount -t vfat -o uid=0,gid=0,umask=077 "${LOOPDEV}p1" "$BOOT_MNT"
 fi
+
+# Rootfs (optional)
 sudo mount "${LOOPDEV}p2" "$ROOT_MNT" 2>/dev/null || true
 
 # ----------- Helpers -----------
@@ -162,8 +170,12 @@ find_layer_dir() {
 apply_overlay() {
   local src="$1" dst="$2"
   [[ -d "$src" ]] || return 0
+  local opts="$RSYNC_OPTS_ROOT"
+  if [[ "$dst" == "$BOOT_MNT" ]]; then
+    opts="$RSYNC_OPTS_BOOT"
+  fi
   echo "Overlay -> $dst : $src"
-  sudo rsync $RSYNC_OPTS "$src"/ "$dst"/
+  sudo rsync $opts "$src"/ "$dst"/
 }
 
 run_customize() {
