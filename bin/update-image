@@ -9,7 +9,7 @@ declare -a SEARCH=()     # -S PATH (repeatable)
 PROFILE_ID=""            # -p ID   (profile file listing layer names)
 LAYER_CSV=""             # --layers id1,id2,...
 declare -a VARS=()       # --var KEY=VALUE (repeatable)
-RSYNC_OPTS="-aHAX --numeric-ids --inplace"
+RSYNC_OPTS_ROOT="-aHAX --numeric-ids --inplace"
 RSYNC_OPTS_BOOT="-rlt --inplace --no-perms --no-owner --no-group"
 
 usage() {
