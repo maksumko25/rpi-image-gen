@@ -1,90 +1,206 @@
 #!/usr/bin/env bash
-# bin/update-image
 set -euo pipefail
 
-# --- Locate project root (same pattern as main) ---
-rootpath() {
-  local dir
-  dir=$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")
-  if [[ -f "${dir}/../LICENSE" ]]; then
-    echo "$(readlink -f "${dir}/..")"
-  elif [[ -d /usr/share/rpi-image-gen ]]; then
-    echo /usr/share/rpi-image-gen
-  else
-    echo "FATAL: cannot locate project root" >&2; exit 1
-  fi
-}
-readonly IGTOP=$(rootpath)
-
-# --- Helpers (reuse upstream) ---
-# shellcheck source=/dev/null
-source "$IGTOP/lib/common.sh"   # run, runenv, runhook, die, msg, warn
-PATH="$IGTOP/bin:$PATH"
+# ----------- CLI -----------
+IMG=""
+OUT=""
+RECOMPRESS="n"
+declare -a SEARCH=()     # -S PATH (repeatable)
+PROFILE_ID=""            # -p ID   (profile file listing layer names)
+LAYER_CSV=""             # --layers id1,id2,...
+declare -a VARS=()       # --var KEY=VALUE (repeatable)
+RSYNC_OPTS="-aHAX --numeric-ids --inplace"
 
 usage() {
-  cat <<EOF
-Usage: rpi-image-gen update-image -i /path/to/image.img [-S /extra/search] [-c config.yaml] [IGconf_* overrides...]
+  cat <<'EOF'
+Usage:
+  rpi-image-gen update-image -i <image.(img|img.xz)> [--out <out.img>] \
+    [-S <search_dir> ...] [-p <profile_id> | --layers <id1,id2,...>] \
+    [--var KEY=VALUE ...] [--xz]
+
+Where:
+  -i, --image     Source image path (.img or .img.xz)
+  --out           Optional output .img path (default: edit a temp copy if input is .xz; otherwise edit in-place)
+  -S              Add a search path (may be repeated). Order = precedence.
+                  Typical: -S ./ext -S .
+  -p              Profile ID: a text file under <search>/profile/<ID> listing layer names (one per line; '#' comments ok)
+  --layers        Comma-separated layer ids (alternative to -p)
+  --var           Provide variables for scripts/templates (become IGconf_<KEY> env vars). Repeatable.
+  --xz            Recompress OUT/.img to .img.xz on success
+
+Layer content (any optional subset per layer):
+  <search>/layer/<id>/update/bootfs-overlay/   -> copied onto boot partition
+  <search>/layer/<id>/update/rootfs-overlay/   -> copied onto rootfs partition
+  <search>/layer/<id>/update/customize.d/*.sh  -> executed on host with args: <ROOTFS> <BOOTFS>
+                                                   (Your script may chroot to <ROOTFS> if needed)
 
 Examples:
-  rpi-image-gen update-image -i ./work/my.img -S ./ext -c ./custom.yaml IGconf_device_hostname=foo
-  rpi-image-gen update-image -i ./work/my.img IGconf_update_pkgs="htop curl"   # will apt-get install inside the image
+  # Replace cmdline.txt using a layer "cmdline-my" found in ./ext/layer/cmdline-my/update/bootfs-overlay/cmdline.txt
+  sudo rpi-image-gen update-image -i ./deb12.img \
+       -S ./ext --layers cmdline-my
 
-What it does:
-  * Maps the image with losetup, mounts boot+root
-  * Applies any rootfs overlays from image/device asset dirs found along the search path
-  * Runs device/image post-build hooks against the mounted rootfs
-  * Optionally runs a chroot "package update" step if IGconf_update_pkgs is set
-  * Unmounts and detaches loop device (even on errors)
+  # Same, but image is .xz and you want .xz output again:
+  sudo rpi-image-gen update-image -i ./deb12.img.xz \
+       -S ./ext --layers cmdline-my --xz
+
+  # Apply multiple layers from a profile file ./ext/profile/wifi-and-cmdline:
+  sudo rpi-image-gen update-image -i ./deb12.img -S ./ext -p wifi-and-cmdline \
+       --var network_ssid=MySSID --var network_psk=SuperSecret
 EOF
 }
 
-IMG=""
-SRCDIR="$(pwd)"
-CONFIG=""
-EXTRA_ARGS=()
-
-# Parse flags
-while (( "$#" )); do
-  case "${1:-}" in
-    -i|--image) IMG="$(readlink -f "$2")"; shift 2;;
-    -S|--src)   SRCDIR="$(readlink -f "$2")"; shift 2;;
-    -c|--config) CONFIG="$(readlink -f "$2")"; shift 2;;
+# Parse
+while (( $# )); do
+  case "$1" in
+    -i|--image) IMG="$2"; shift 2;;
+    --out) OUT="$2"; shift 2;;
+    -S) SEARCH+=("$(readlink -m "$2")"); shift 2;;
+    -p) PROFILE_ID="$2"; shift 2;;
+    --layers) LAYER_CSV="$2"; shift 2;;
+    --var) VARS+=("$2"); shift 2;;
+    --xz) RECOMPRESS="y"; shift;;
     -h|--help) usage; exit 0;;
-    IGconf_*=*) EXTRA_ARGS+=("$1"); shift;;
-    *) echo "Unknown arg: $1" >&2; usage; exit 2;;
+    *) echo "Unknown option: $1" >&2; usage; exit 2;;
   esac
 done
 
-[[ -n "$IMG" && -f "$IMG" ]] || die "-i/--image is required and must point to an existing .img"
+[[ -n "$IMG" ]] || { echo "Missing --image"; usage; exit 2; }
 
-# --- Context like main driver ---
-declare -A ctx=(
-  [SRC_DIR]="$SRCDIR"
-  [TMPDIR]="$(mktemp -d)"
-)
-trap 'rc=$?; set +e; if mountpoint -q "${MNT_ROOT:-/mnt/none}"; then sudo umount -R "${MNT_ROOT}"; fi; if mountpoint -q "${MNT_BOOT:-/mnt/none}"; then sudo umount -R "${MNT_BOOT}"; fi; [[ -n "${LOOPDEV:-}" ]] && sudo losetup -d "${LOOPDEV}" || true; rm -rf "${ctx[TMPDIR]}"; exit $rc' EXIT
+# Defaults: if no -S given, search current repo root then /usr/share install
+if [[ ${#SEARCH[@]} -eq 0 ]]; then
+  # derive IGTOP similar to main script
+  this_dir=$(dirname "$(readlink -e "$0")")
+  IGTOP="$(cd "$this_dir/.." && pwd -P)"
+  SEARCH+=("$IGTOP" "/usr/share/rpi-image-gen")
+fi
 
-# Build PATH/CONFIG/LAYER search like upstream path_refresh
-CONFIG_PATH="$IGTOP/config"
-LAYER_PATH="$IGTOP/device:$IGTOP/image:$IGTOP/layer"
-if [[ ! "$IGTOP" -ef "${ctx[SRC_DIR]}" ]]; then
-  [[ -d "${ctx[SRC_DIR]}/config" ]] && CONFIG_PATH="${ctx[SRC_DIR]}/config:${CONFIG_PATH}"
-  for d in device image layer; do
-    [[ -d "${ctx[SRC_DIR]}/$d" ]] && LAYER_PATH="${ctx[SRC_DIR]}/$d:${LAYER_PATH}"
+# Collect layer ids
+declare -a LAYERS=()
+if [[ -n "$PROFILE_ID" ]]; then
+  found=""
+  for S in "${SEARCH[@]}"; do
+    f="$S/profile/$PROFILE_ID"
+    if [[ -f "$f" ]]; then found="$f"; break; fi
   done
+  [[ -n "$found" ]] || { echo "Profile '$PROFILE_ID' not found under: ${SEARCH[*]}"; exit 2; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    LAYERS+=("$line")
+  done <"$found"
+fi
+if [[ -n "$LAYER_CSV" ]]; then
+  IFS=',' read -r -a tmp <<<"$LAYER_CSV"
+  LAYERS+=("${tmp[@]}")
+fi
+# Dedup while preserving order
+declare -A seen=()
+declare -a LAYERS_U=()
+for L in "${LAYERS[@]}"; do
+  [[ -n "${seen[$L]:-}" ]] || { LAYERS_U+=("$L"); seen["$L"]=1; }
+done
+LAYERS=("${LAYERS_U[@]}")
+
+if [[ ${#LAYERS[@]} -eq 0 ]]; then
+  echo "No layers provided (use -p <profile> or --layers id1,id2)"; usage; exit 2
 fi
 
-# Optional: parse config into env (so IGconf_* get computed from YAML)
-IGENVF="${ctx[TMPDIR]}/ig.env"; : > "$IGENVF"
-OVR="${ctx[TMPDIR]}/overrides.env"; : > "$OVR"
-for kv in "${EXTRA_ARGS[@]}"; do echo "$kv" >> "$OVR"; done
-if [[ -n "$CONFIG" ]]; then
-  ig config --path "$CONFIG_PATH" "$CONFIG" --overrides "$OVR" --write-to "$IGENVF" \
-    || die "Config parse failed"
-fi
-# Always add hooks dir env var like main
-echo "LAYER_HOOKS=\"$IGTOP/layer-hooks\"" >> "$IGENVF"
-echo "RPI_TEMPLATES=\"$IGTOP/templates/rpi\"" >> "$IGENVF"
+# Export variables as IGconf_* for hooks/templates
+for kv in "${VARS[@]}"; do
+  k="${kv%%=*}"; v="${kv#*=}"
+  export "IGconf_${k}=$v"
+done
 
-# Export key vars
-mapfile -t ENVVARS <
+# ----------- Work dirs & cleanup -----------
+IMG="$(readlink -e "$IMG")"
+WORKDIR="$(mktemp -d)"
+BOOT_MNT="$WORKDIR/boot"; ROOT_MNT="$WORKDIR/root"
+mkdir -p "$BOOT_MNT" "$ROOT_MNT"
+
+cleanup() {
+  set +e
+  mountpoint -q "$BOOT_MNT" && sudo umount "$BOOT_MNT"
+  mountpoint -q "$ROOT_MNT" && sudo umount "$ROOT_MNT"
+  [[ -n "${LOOPDEV:-}" ]] && sudo losetup -d "$LOOPDEV" 2>/dev/null
+  rm -rf "$WORKDIR"
+}
+trap cleanup EXIT INT TERM
+
+# Decompress if needed
+SRC_IS_XZ="n"
+if [[ "$IMG" =~ \.xz$ ]]; then
+  SRC_IS_XZ="y"
+  DECOMP_IMG="$WORKDIR/image.img"
+  echo "Decompressing $IMG ..."
+  xz -dc -- "$IMG" > "$DECOMP_IMG"
+  IMG="$DECOMP_IMG"
+fi
+
+# Copy if --out specified
+if [[ -n "${OUT:-}" ]]; then
+  cp --reflink=auto --sparse=always "$IMG" "$OUT"
+  IMG="$(readlink -m "$OUT")"
+fi
+
+# Map & mount
+echo "Mapping loop device..."
+LOOPDEV="$(sudo losetup -Pf --show "$IMG")"
+
+if ! sudo mount "${LOOPDEV}p1" "$BOOT_MNT"; then
+  echo "ERROR: cannot mount ${LOOPDEV}p1 as boot"; exit 1
+fi
+sudo mount "${LOOPDEV}p2" "$ROOT_MNT" 2>/dev/null || true
+
+# ----------- Helpers -----------
+find_layer_dir() {
+  local id="$1"
+  for S in "${SEARCH[@]}"; do
+    [[ -d "$S/layer/$id" ]] && { echo "$S/layer/$id"; return 0; }
+  done
+  return 1
+}
+
+apply_overlay() {
+  local src="$1" dst="$2"
+  [[ -d "$src" ]] || return 0
+  echo "Overlay -> $dst : $src"
+  sudo rsync $RSYNC_OPTS "$src"/ "$dst"/
+}
+
+run_customize() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  echo "Running customize scripts in: $dir"
+  # Provide root/boot paths and IGconf_* env to scripts
+  for sh in $(find "$dir" -type f -name '*.sh' | sort); do
+    echo " -> $sh"
+    chmod +x "$sh" 2>/dev/null || true
+    IGconf_rootfs="$ROOT_MNT" IGconf_bootfs="$BOOT_MNT" "$sh" "$ROOT_MNT" "$BOOT_MNT"
+  done
+}
+
+# ----------- Apply layers -----------
+for L in "${LAYERS[@]}"; do
+  LDIR="$(find_layer_dir "$L")" || { echo "Layer '$L' not found in: ${SEARCH[*]}"; exit 2; }
+  echo "== Layer: $L  @ $LDIR =="
+
+  # Boot overlay
+  apply_overlay "$LDIR/update/bootfs-overlay" "$BOOT_MNT"
+
+  # Rootfs overlay
+  apply_overlay "$LDIR/update/rootfs-overlay" "$ROOT_MNT"
+
+  # Customize scripts
+  run_customize "$LDIR/update/customize.d"
+done
+
+sync
+
+# ----------- Recompress if asked -----------
+if [[ "${RECOMPRESS}" == "y" ]]; then
+  OUTIMG="$IMG"
+  [[ -n "${OUT:-}" ]] && OUTIMG="$OUT"
+  echo "Compressing to ${OUTIMG}.xz ..."
+  xz -T0 -f "$OUTIMG"
+fi
+
+echo "update-image: OK"
