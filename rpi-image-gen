@@ -27,6 +27,10 @@ source "$IGTOP/lib/cli.sh"
 source "$IGTOP/lib/common.sh"
 source "$IGTOP/lib/dependencies.sh"
 
+if [[ $# -gt 0 && "$1" == "update-image" ]]; then
+  shift
+  exec "$IGTOP/bin/update-image" "$@"
+fi
 
 # Global context
 declare -A ctx=(
